@@ -1,0 +1,11 @@
+numpy
+pandas
+scikit-learn
+pmdarima
+mxnet==1.6
+git+https://github.com/awslabs/gluon-ts@master#egg=gluonts
+fire 
+jupyter
+mxboard
+tensorboard
+

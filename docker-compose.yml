@@ -1,0 +1,13 @@
+version: '3'
+
+services:
+    hts-embeddings:
+        image: hts-embeddings
+        volumes:
+            - ./src:/root/src
+            - ./notebooks:/root/notebooks
+            - ./data:/root/data
+            - ./gluon-ts:/root/gluon-ts
+        ## Baseline exp
+        #command: python experiment.py reproduce --epochs=20  --include_arima=False --include_self_supervised=False --val_set=False --output_path='data/preds_20_l2' --serialize_path='data/models_20_l2' --reconciled_path='data/reconciled_preds_20_l2'
+        #command: python experiment.py optimal_reconciliation  --include_arima=False --include_self_supervised=False --val_set=False --metrics_file='data/metrics/baseline_20_l2.txt' --output_path='data/preds_20_l2' --serialize_path='data/models_20_l2' --reconciled_path='data/reconciled_preds_20_l2'
