@@ -8,6 +8,8 @@ import numpy as np
 from sklearn.model_selection import TimeSeriesSplit
 from gluonts.dataset.field_names import FieldName
 from gluonts.dataset.common import ListDataset
+from gluonts.transform import InstanceSampler
+from gluonts.core.component import validated
 
 TRAVEL_TYPES = 4
 
@@ -62,29 +64,29 @@ def regex_labels(
     prefix_1, prefix_2, prefix_3 = prefixes
 
     region_labels = [
-        re.compile(f'{region}.+') 
+        re.compile(f'^{region}.+') 
         for region in prefix_3
     ]
     zone_labels = [
-        re.compile(f'{zone}.+') 
+        re.compile(f'^{zone}.+') 
         for zone in prefix_2
     ]
     state_labels = [
-        re.compile(f'{state}.+') 
+        re.compile(f'^{state}.+') 
         for state in prefix_1
     ] 
     zone_by_travel_labels = [
-        re.compile(f'{zone}.{travel}')
+        re.compile(f'^{zone}.{travel}')
         for zone in prefix_2
         for travel in travel_types
     ]
     state_by_travel_labels = [
-        re.compile(f'{state}..{travel}')
+        re.compile(f'^{state}..{travel}')
         for state in prefix_1
         for travel in travel_types
     ]
     country_by_travel_labels = [
-        re.compile(f'...{travel}') 
+        re.compile(f'^...{travel}') 
         for travel in travel_types
     ]
 
@@ -101,7 +103,7 @@ def sum_filtered_cols(
     df: pd.DataFrame,
     filter_cols: List[re.Pattern],
     sort: bool = True,
-) -> pd.DataFrame:
+) -> Tuple[pd.DataFrame, List[List[int]]]:
     """ sums df columns that match regular expressions in 'filter_cols' along column 
         (series, not time) axis, sorts columns of resulting df lexicographically
     
@@ -114,22 +116,25 @@ def sum_filtered_cols(
             (default: {True})
     
     Returns:
-        pd.DataFrame -- summed and (optionally) lexicographically sorted data frame
+        Tuple[pd.DataFrame, List[List[int]] -- 
+            1) summed and (optionally) lexicographically sorted data frame
+            2) nested list indices of df columns that match each regular expression
     """
 
     new_df = pd.DataFrame(index = df.index)
+    all_match_idxs = []
     for regex in filter_cols:
-        new_df[regex.pattern] = df[
-            list(filter(regex.match, df.columns))
-        ].sum(axis=1)
+        match_idxs = [i for i, col in enumerate(df.columns) if re.search(regex, col)]
+        all_match_idxs.append(match_idxs)
+        new_df[regex.pattern] = df.iloc[:, match_idxs].sum(axis=1)
     if sort:
         new_df = new_df.reindex(sorted(new_df.columns), axis = 1)
-    return new_df
+    return new_df, all_match_idxs
 
 def all_dfs(
     tourism_df: pd.DataFrame,
     labels: List[List[re.Pattern]]
-) -> pd.DataFrame:
+) -> Tuple[pd.DataFrame, List[int]]:
     """ generate and combine dataframes for all levels of the hierarchy
 
     Arguments:
@@ -137,31 +142,34 @@ def all_dfs(
         labels {List[List[re.Pattern]]} -- location regexes (one list for each level of hierarchy)
 
     Returns:
-        pd.DataFrame -- single combined dataframe
+        Tuple[pd.DataFrame, List[int] -- 
+            1) single combined dataframe
+            2) oredered list of indices of base forecast df columns that match 
+                aggregated forecast column
     """
 
     region_labels, zone_labels, state_labels, zone_by_travel_labels, state_by_travel_labels, country_by_travel_labels = labels
 
-    region_df = sum_filtered_cols(tourism_df, region_labels)
-    zone_df = sum_filtered_cols(tourism_df, zone_labels)
-    state_df = sum_filtered_cols(tourism_df, state_labels)
-    zone_by_travel_df = sum_filtered_cols(
+    region_df, region_idxs = sum_filtered_cols(tourism_df, region_labels)
+    zone_df, zone_idxs = sum_filtered_cols(tourism_df, zone_labels)
+    state_df, state_idxs = sum_filtered_cols(tourism_df, state_labels)
+    zone_by_travel_df, zone_by_travel_idxs = sum_filtered_cols(
         tourism_df, 
         zone_by_travel_labels,
         sort=False    
     )
-    state_by_travel_df = sum_filtered_cols(
+    state_by_travel_df, state_by_travel_idxs = sum_filtered_cols(
         tourism_df, 
         state_by_travel_labels, 
         sort=False
     )
-    country_df = sum_filtered_cols(tourism_df, [re.compile(f'.+')])
-    country_by_travel_df = sum_filtered_cols(
+    country_df, country_idxs = sum_filtered_cols(tourism_df, [re.compile(f'.+')])
+    country_by_travel_df, country_by_travel_idxs = sum_filtered_cols(
         tourism_df, 
         country_by_travel_labels,
         sort=False
     )
-    return pd.concat(
+    all_df = pd.concat(
         [
             country_df, 
             state_df, 
@@ -174,6 +182,15 @@ def all_dfs(
         ], 
         axis=1
     )
+
+    all_idxs = country_idxs + state_idxs + zone_idxs + region_idxs + country_by_travel_idxs + \
+        state_by_travel_idxs + zone_by_travel_idxs
+
+    all_idxs = [
+        [idx + all_df.shape[1] - tourism_df.shape[1] for idx in idx_list]
+        for idx_list in all_idxs
+    ]
+    return all_df, all_idxs
 
 def level_counts(
     prefixes: List[List[str]],
@@ -207,16 +224,18 @@ def level_counts(
 
 def preprocess(
     tourism_df: pd.DataFrame
-) -> Tuple[pd.DataFrame, List[int]]:
+) -> Tuple[pd.DataFrame, List[int], List[List[int]]]:
     """ preprocess hierarchical tourism df into one df with all level series
     
     Arguments:
         tourism_df {pd.DataFrame} -- tourism frame with bottom level series (region/type)
     
     Returns:
-        Tuple[pd.DataFrame, List[int]] -- 
+        Tuple[pd.DataFrame, List[int], List[List[int]]] -- 
             1) new df with region, zone, state, and country series as separate columns
             2) list of the counts of leaves that sum to each node in the hierarchy
+            3) list of list of indices representing the base level series that add up 
+                to each aggregation constraint
     """
 
     tourism_df['Year'] = tourism_df['Year'].ffill().astype(int)
@@ -227,19 +246,17 @@ def preprocess(
     travel_types = [col[-3:] for col in tourism_df.columns[:4]]
     prefixes = unique_prefixes(tourism_df.columns, [1,2,3])
     labels = regex_labels(travel_types, prefixes)
-    all_df = all_dfs(tourism_df, labels)
+    all_df, prefix_idxs = all_dfs(tourism_df, labels)
     counts = level_counts(prefixes, labels)
 
-    return all_df, counts
+    return all_df, counts, prefix_idxs
 
 def make_hierarchy_level_dict(
-    df: pd.DataFrame,
     level_counts: List[List[int]]
 ) -> Dict[str, List[int]]:
     """ creates dict of which columns (series) belong to which level of hierarchy 
     
     Arguments:
-        df {pd.DataFrame} -- data frame with all series
         level_counts {List[List[int]]} -- list of the counts of leaves that sum to each node, 
             one list for each level in the hierarchy
     
@@ -259,55 +276,41 @@ def make_hierarchy_level_dict(
     }
 
 def make_hierarchy_agg_dict(
-    df: pd.DataFrame,
-    level_counts: List[List[int]]
+    prefix_idxs: List[List[int]],
 ) -> Dict[int, Tuple[int, List[int]]]:
     """ creates dict of which columns (series) aggregate to which other individual columns (series)
         in the hierarchical, grouped time series 
     
     Arguments:
-        df {pd.DataFrame} -- data frame with all series
         level_counts {List[List[int]]} -- list of the counts of leaves that sum to each node, 
             one list for each level in the hierarchy
+        prefix_idxs {List[List[int]]} -- list of list of indices representing the base level series that add up 
+            to each aggregation constraint
     
     Returns:
         Dict[int, Tuple[int, List[int]]] -- dictionary with this structure
             constraint number: (aggregate series index, [disaggregated series indices])
     """
 
-    agg = [counts for count_list in level_counts for counts in count_list]
-    geo_constraints = {
-        s_i: (s_i, [
-            idx for idx in range(sum(agg[:s_i+1]), sum(agg[:s_i+1]) + disagg_count)
-        ]) 
-        for s_i, disagg_count in enumerate(agg[1:])
-    }
+    return {agg_idx: base_idxs for agg_idx, base_idxs in enumerate(prefix_idxs)}
 
-    # travel_geo_constraints = {
-    #     s_i + len(geo_constraints): (s_i, [
-    #         i for i in range(
-    #             sum(agg) + s_i * TRAVEL_TYPES, 
-    #             sum(agg) + (s_i + 1) * TRAVEL_TYPES
-    #         )
-    #     ])
-    #     for s_i in range(sum(agg))
-    # }
+def inspect_hierarchy_agg_dict(
+    hierarchy_agg_dict: Dict[int, Tuple[int, List[int]]],
+    column_names: pd.Index,
+    idx: int = 0
+) -> None:
+    """ prints key/value pair in hierarchy agg dict and names of corresponding columns in df
 
-    travel_constraints = {
-        s_i * TRAVEL_TYPES + s_j + len(geo_constraints): (
-            s_i * TRAVEL_TYPES + s_j + sum(agg), 
-            [idx for idx in range(
-                s_j + sum(agg) + sum(agg[:s_i+1]) * TRAVEL_TYPES, 
-                s_j + sum(agg) + (sum(agg[:s_i+1]) + disagg_count) * TRAVEL_TYPES,
-                TRAVEL_TYPES
-            )]
-        )
-        for s_j in range(TRAVEL_TYPES)
-        for s_i, disagg_count in enumerate(agg[1:])
-    }
-
-    return {**geo_constraints, **travel_constraints}
-
+    Arguments:
+        hierarchy_agg_dict {Dict[int, Tuple[int, List[int]]]} -- mapping of which columns (series) 
+            aggregate to which other individual columns (series) in the hierarchical, grouped time series
+        column_names {pd.Index} -- list of columns
+        
+    Keyword Arguments:
+        idx {int} -- idx of key in hierarchy to inspect (default: {0})
+    """
+    print(f'Aggregate column: {column_names[idx]}')
+    print(f'Disaggregated columns: {column_names[hierarchy_agg_dict[idx]]}')
 
 def split(
     X: np.ndarray,
@@ -340,7 +343,7 @@ def split(
     filtered_splits = []
     for train_index, test_index in splits.split(X):
         if len(train_index) >= min_train_size:
-            filtered_splits.append((train_index, test_index))
+            filtered_splits.append((train_index, test_index[:horizon]))
     
     print(f'The dataset has been split into {len(filtered_splits)} folds for CV')
     return filtered_splits
@@ -427,3 +430,19 @@ def build_datasets(
             ))
             for (train_idxs, test_idxs) in splits 
         ]
+
+class FixedUnitSampler(InstanceSampler):
+    """
+    Samples exactly one window from each time series
+    """
+
+    @validated()
+    def __init__(self) -> None:
+        pass
+
+    def __call__(self, ts: np.ndarray, a: int, b: int) -> np.ndarray:
+        assert (
+            a <= b
+        ), "First index must be less than or equal to the last index."
+        
+        return (np.random.randint(a,b+1),)

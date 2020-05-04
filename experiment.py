@@ -6,16 +6,18 @@
 #
 #   1) python experiment.py reproduce 
 #       
-#   This will reproduce baseline experiments comparing DeepAR, DeepAR with categorical embeddings, 
-#   DeepAR with embedding aggregation penalty, and (optionally) DeepAR with self-supervised
-#   reconciliation penalty. See class docstring for description of keyword arguments.
+#   This will reproduce baseline experiments comparing DeepAR with categorical embeddings, 
+#   DeepAR with embedding aggregation penalties (L2 + Cosine Distance), and (optionally) 
+#   DeepAR with self-supervised reconciliation penalty. See class docstring for description 
+#   of keyword arguments.
 #
 #   2) python experiment.py optimal_rec
 #
-#   This will reproduce experiments comparing aforementioned DeepAR models to baseline Arima model,
-#   Arima model with MinT reconciliation, and DeepAR models with MinT reconciliation. See class
-#   docstring for description of keyword arguments. The reproduce() method must be called before the 
-#   optimal_rec() method to generate predictions that can be post-hoc reconciled.
+#   This will reproduce experiments comparing aforementioned DeepAR models to DeepAR models with 
+#   MinT reconciliation. See class docstring for description of keyword arguments. First, the reproduce() 
+#   method must be called to fit models and produce initial forecasts. Next, the `hts_ols.R` script 
+#   must be run in 'R' to generate MinT reconciled forecasts. Finally, the optimal_rec() method 
+#   can be run to evaluate and compare unreconciled and reconciled forecasts. 
 #
 #######
 
@@ -57,13 +59,13 @@ class Experiment(object):
         metrics_file: str = 'data/metrics/baseline.txt',
         horizon: int = 12,
         train_size: int = 108,
-        epochs: int = 10,
-        val_set: bool = True,
-        include_self_supervised: bool = True,
-        include_arima: bool = True,
+        epochs: int = 50,
+        val_set: bool = False,
+        include_self_supervised: bool = False,
+        include_arima: bool = False,
         embed_dim_ratio: int = 1,
         embed_penalty_lambda: int = 1,
-        self_sup_penalty_lambda: float = 10e-8,
+        self_sup_penalty_lambda: float = 10e-7,
     ) -> None:
 
         """ convenience class to reproduce experiments
@@ -89,7 +91,7 @@ class Experiment(object):
             embed_dim_ratio {int} -- ratio between embedding dim and RNN hidden state dim (default: {1})
             embed_penalty_lambda {int} -- lambda for embedding reconciliation penalty (default: {1})
             self_sup_penalty_lambda {float} -- lambda for self-supervised reconciliation penalty 
-                (default: {10e-8})
+                (default: {10e-7})
         
         Raises:
             ValueError: The reproduce() method must be called before the optimal_rec() method
@@ -113,7 +115,6 @@ class Experiment(object):
         self.metrics_file = metrics_file
         self.fits = None
         self.model_names = [
-            'DeepAR',
             'DeepAR-Cat-Var',
             'DeepAR-Embed-Agg-Cosine',
             'DeepAR-Embed-Agg-L2',
@@ -121,13 +122,14 @@ class Experiment(object):
             'Arima-Baseline',
             'Arima-Baseline-MinT',
             'DeepAR-Cat-Var-MinT',
-            'DeepAR-Embed-Agg-MinT'
+            'DeepAR-Embed-Agg-Cosine-MinT',
+            'DeepAR-Embed-Agg-L2-MinT'
         ]
         if not self.include_self_supervised:
             self.model_names.remove('DeepAR-Self-Sup')
-            self.active_names = self.model_names[:4]
+            self.active_names = self.model_names[:3]
         else:
-            self.active_names = self.model_names[:5]
+            self.active_names = self.model_names[:4]
 
         # mkdirs for output paths if they dont exist
         if not os.path.isdir(output_path):
@@ -139,7 +141,7 @@ class Experiment(object):
         metric_dir = os.path.sep.join(metrics_file.split(os.path.sep)[:-1])
         if not os.path.isdir(metric_dir):
             os.mkdir(metric_dir)
-        data_dir = os.path.sep.join(output_path.split(os.path.sep)[:-1])
+        self.data_dir = os.path.sep.join(output_path.split(os.path.sep)[:-1])
         
         print(f'Using device: {get_mxnet_context()}')
 
@@ -147,7 +149,7 @@ class Experiment(object):
         
         ## prepare data
         tourism_data = pd.read_csv(self.datapath)
-        tourism_data, level_counts = preprocess(tourism_data)
+        tourism_data, level_counts, prefix_idxs = preprocess(tourism_data)
 
         # create train/val/test datasets, one for each of 10 CV folds
         splits = split(
@@ -167,55 +169,33 @@ class Experiment(object):
             ]
 
         # create mappings of hierarchy that will be used for fitting/evaluation
-        self.hierarchy_agg_dict = make_hierarchy_agg_dict(tourism_data, level_counts)
-        self.hierarchy_level_dict = make_hierarchy_level_dict(tourism_data, level_counts)
+        self.hierarchy_agg_dict = make_hierarchy_agg_dict(prefix_idxs)
+        self.hierarchy_level_dict = make_hierarchy_level_dict(level_counts)
 
     def fit(self):
-        
-        tb_log_dirs = [
-            [f'{data_dir}/logs/{name}-fold-{i}' for i in range(len(self.train_datasets))]
-            for name in self.model_names[:4]
-        ]
 
         self.fits = [
-            # baseline DeepAR model without the learned categorical embedding
-            [
-                fit_deepar(
-                    training_data, 
-                    validation_data,
-                    epochs=self.epochs,
-                    hierarchy_agg_dict=self.hierarchy_agg_dict,
-                    print_rec_penalty=False,
-                    tb_log_dir=log_dir
-                )
-                for (training_data, validation_data, _), log_dir in zip(
-                    self.train_datasets,
-                    tb_log_dirs[0]
-                )
-            ],
             # baseline DeepAR model with the learned categorical embedding
             [
                 fit_deepar(
                     training_data, 
                     validation_data,
+                    pred_length=self.horizon,
                     epochs=self.epochs,
                     use_cat_var=True,
                     cardinality=[len(training_data)],
                     hierarchy_agg_dict=self.hierarchy_agg_dict,
                     embedding_dim_ratio=self.embed_dim_ratio,
                     print_rec_penalty=False,
-                    tb_log_dir=log_dir
                 )
-                for (training_data, validation_data, _), log_dir in zip(
-                    self.train_datasets,
-                    tb_log_dirs[0]
-                )
+                for (training_data, validation_data, _) in self.train_datasets
             ],
             # DeepAR models with cosine embedding aggregation penalty
             [
                 fit_deepar(
                     training_data, 
                     validation_data,
+                    pred_length=self.horizon,
                     epochs=self.epochs,
                     use_cat_var=True,
                     cardinality=[len(training_data)],
@@ -223,18 +203,15 @@ class Experiment(object):
                     embedding_dim_ratio=self.embed_dim_ratio,
                     embedding_agg_penalty=self.embed_penalty_lambda,
                     print_rec_penalty=False,
-                    tb_log_dir=log_dir
                 )
-                for (training_data, validation_data, _), log_dir in zip(
-                    self.train_datasets,
-                    tb_log_dirs[0]
-                )
+                for (training_data, validation_data, _) in self.train_datasets
             ],
             # DeepAR models with l2 embedding aggregation penalty
             [
                 fit_deepar(
                     training_data, 
                     validation_data,
+                    pred_length=self.horizon,
                     epochs=self.epochs,
                     use_cat_var=True,
                     cardinality=[len(training_data)],
@@ -243,12 +220,8 @@ class Experiment(object):
                     embedding_agg_penalty=self.embed_penalty_lambda,
                     embedding_dist_metric='l2',
                     print_rec_penalty=False,
-                    tb_log_dir=log_dir
                 )
-                for (training_data, validation_data, _), log_dir in zip(
-                    self.train_datasets,
-                    tb_log_dirs[0]
-                )
+                for (training_data, validation_data, _) in self.train_datasets
             ]
         ]
         if self.include_self_supervised:
@@ -257,6 +230,7 @@ class Experiment(object):
                     fit_deepar(
                         training_data, 
                         validation_data,
+                        pred_length=self.horizon,
                         epochs=self.epochs,
                         use_cat_var=True,
                         cardinality=[len(training_data)],
@@ -298,7 +272,7 @@ class Experiment(object):
         
         all_filenames = [
             [f'{self.output_path}/{name}-fold-{i}.csv' for i in range(len(self.train_datasets))]
-            for name in self.model_names[:4]
+            for name in self.model_names[:3]
         ]
         self.evaluations = [
             [
@@ -311,7 +285,7 @@ class Experiment(object):
                 ) 
                 for predictor, (train_data, test_data), filename in zip(models, self.test_datasets, filenames)
             ]
-            for models, filenames in zip(self.fits[:4], all_filenames)
+            for models, filenames in zip(self.fits[:3], all_filenames)
         ]
         if self.include_self_supervised:
             self.evaluations.append(
@@ -322,7 +296,7 @@ class Experiment(object):
                         test_data, 
                         self.hierarchy_level_dict
                     ) 
-                    for predictor, (train_data, test_data) in zip(self.fits[4], self.test_datasets)
+                    for predictor, (train_data, test_data) in zip(self.fits[3], self.test_datasets)
                 ]
             )
         if self.include_arima:
@@ -341,9 +315,9 @@ class Experiment(object):
     def evaluate_reconciled(self) -> None:
 
         if self.include_arima:
-            names = self.model_names[-3:]
+            names = self.model_names[-4:]
         else:
-            names = self.model_names[-2:]
+            names = self.model_names[-3:]
         self.active_names += names
 
         reconciled_preds = [
@@ -380,6 +354,7 @@ class Experiment(object):
         self.serialize()
         self.unserialize()
         self.evaluate()
+        self.compare()
 
     def optimal_reconciliation(self) -> None:
 

@@ -10,14 +10,240 @@ import pandas as pd
 import mxnet as mx
 from mxnet.gluon import HybridBlock
 from gluonts.trainer import Trainer
-from gluonts.distribution import NegativeBinomialOutput
+from gluonts.distribution import NegativeBinomialOutput, GaussianOutput
 from gluonts.dataset.util import to_pandas
 from gluonts.dataset.common import ListDataset
-from gluonts.model.predictor import GluonPredictor
+from gluonts.dataset.field_names import FieldName
+from gluonts.model.predictor import Predictor, GluonPredictor
+from gluonts.model.deepar import DeepAREstimator
+from gluonts.support.util import copy_parameters
+from gluonts.transform import (
+    AddAgeFeature,
+    AddObservedValuesIndicator,
+    AddTimeFeatures,
+    AsNumpyArray,
+    Chain,
+    InstanceSplitter,
+    RemoveFields,
+    SetField,
+    Transformation,
+    VstackFeatures,
+    InstanceSampler,
+)
 import pmdarima as pm
 
 # First Party imports
-from .rec_penalty import DeepARRecPenaltyEstimator
+from .data import FixedUnitSampler
+from .network import (
+    DeepARRecPenaltyTrainingNetwork, 
+    DeepARRecPenaltyPredictionNetwork,
+    RepresentableBlockPredictorResiduals
+)
+
+class DeepARRecPenaltyEstimator(DeepAREstimator):
+    """ Construct a DeepAREstimator that adds a self-supervised and/or embedding 
+        reconciliation penalty to its likelihood loss.
+
+        We overwrite the create_transformation() method to use a FixedUnitSampler() in the 
+        InstanceSplitter() step, which samples exactly one window from each training series. 
+        In each batch, it is necessary to have one sample of each individual series from the 
+        training set to calculate the self-supervised reconciliation penalty, which is applied
+        over all samples from the training set. This is necessary because the DeepAREstimator learns
+        a univariate global model for the dynamics and thus the randomized block coordinate descent
+        optimization algorithm proposed in "A Self-supervised Approach to Hierarchical Forecasting 
+        with Applications to Groupwise Synthetic Controls" is not applicable. 
+    """
+    
+    def __init__(
+        self, 
+        *args,
+        self_supervised_penalty: float = 0,
+        embedding_agg_penalty: float = 0,
+        embedding_dist_metric: str = 'cosine',
+        hierarchy_agg_dict: Dict[int, List[int]] = None,
+        ignore_future_targets: bool = False,
+        store_in_sample_residuals: bool = True,
+        print_rec_penalty: bool = True,
+        **kwargs
+    ) -> None:
+        """
+        
+        Keyword Arguments:
+            self_supervised_penalty {float} -- lambda for self-supervised reconciliation penalty 
+                (default: {0.0})
+            embedding_agg_penalty {float} -- lambda for embedding rec. penalty 
+                (default: {0.0})
+            embedding_dist_metric {str} -- distance metric for embedding rec. penalty
+                (default: {'cosine'})
+            hierarchy_agg_dict {Optional[Dict[int, List[int]]]} -- mapping from individual series to 
+                columns that represent other series that aggregate to this individual series, necessary
+                if self_supervised_penalty > 0 (default: {None})
+            ignore_future_targets {bool} -- whether to include future targets in forecasting loss
+                and past targets in self-supervised reconciliation penalty (default: {False})
+            store_in_sample_residuals {bool} -- whether to store in-sample train predictions when forecasting
+                test data (default: {True})
+            print_rec_penalty {bool} -- whether to print the reconciliation penalty at each step
+                of every epoch (default: {True})
+
+        """
+        super().__init__(*args, **kwargs)
+
+        if self_supervised_penalty > 0:
+            if hierarchy_agg_dict is None:
+                raise ValueError("Must supply 'hierarchy_agg_dict' argument if 'self_supervised_penalty' > 0")
+        if embedding_dist_metric != 'cosine' and embedding_dist_metric != 'l2':
+            raise ValueError("Embedding distance metric must be either 'cosine' or 'l2'")
+
+        self.self_supervised_penalty = self_supervised_penalty
+        self.hierarchy_agg_dict = hierarchy_agg_dict
+        self.ignore_future_targets = ignore_future_targets
+        self.print_rec_penalty = print_rec_penalty
+        self.store_in_sample_residuals = store_in_sample_residuals
+        self.embedding_agg_penalty = embedding_agg_penalty
+        self.embedding_dist_metric = embedding_dist_metric
+        
+    def create_transformation(self) -> Transformation:
+        remove_field_names = [FieldName.FEAT_DYNAMIC_CAT]
+        if not self.use_feat_static_real:
+            remove_field_names.append(FieldName.FEAT_STATIC_REAL)
+        if not self.use_feat_dynamic_real:
+            remove_field_names.append(FieldName.FEAT_DYNAMIC_REAL)
+
+        return Chain(
+            [RemoveFields(field_names=remove_field_names)]
+            + (
+                [SetField(output_field=FieldName.FEAT_STATIC_CAT, value=[0.0])]
+                if not self.use_feat_static_cat
+                else []
+            )
+            + (
+                [
+                    SetField(
+                        output_field=FieldName.FEAT_STATIC_REAL, value=[0.0]
+                    )
+                ]
+                if not self.use_feat_static_real
+                else []
+            )
+            + [
+                AsNumpyArray(
+                    field=FieldName.FEAT_STATIC_CAT,
+                    expected_ndim=1,
+                    dtype=self.dtype,
+                ),
+                AsNumpyArray(
+                    field=FieldName.FEAT_STATIC_REAL,
+                    expected_ndim=1,
+                    dtype=self.dtype,
+                ),
+                AsNumpyArray(
+                    field=FieldName.TARGET,
+                    # in the following line, we add 1 for the time dimension
+                    expected_ndim=1 + len(self.distr_output.event_shape),
+                    dtype=self.dtype,
+                ),
+                AddObservedValuesIndicator(
+                    target_field=FieldName.TARGET,
+                    output_field=FieldName.OBSERVED_VALUES,
+                    dummy_value=self.distr_output.value_in_support,
+                    dtype=self.dtype,
+                ),
+                AddTimeFeatures(
+                    start_field=FieldName.START,
+                    target_field=FieldName.TARGET,
+                    output_field=FieldName.FEAT_TIME,
+                    time_features=self.time_features,
+                    pred_length=self.prediction_length,
+                ),
+                AddAgeFeature(
+                    target_field=FieldName.TARGET,
+                    output_field=FieldName.FEAT_AGE,
+                    pred_length=self.prediction_length,
+                    log_scale=True,
+                    dtype=self.dtype,
+                ),
+                VstackFeatures(
+                    output_field=FieldName.FEAT_TIME,
+                    input_fields=[FieldName.FEAT_TIME, FieldName.FEAT_AGE]
+                    + (
+                        [FieldName.FEAT_DYNAMIC_REAL]
+                        if self.use_feat_dynamic_real
+                        else []
+                    ),
+                ),
+                InstanceSplitter(
+                    target_field=FieldName.TARGET,
+                    is_pad_field=FieldName.IS_PAD,
+                    start_field=FieldName.START,
+                    forecast_start_field=FieldName.FORECAST_START,
+                    train_sampler=FixedUnitSampler(),
+                    past_length=self.history_length,
+                    future_length=self.prediction_length,
+                    time_series_fields=[
+                        FieldName.FEAT_TIME,
+                        FieldName.OBSERVED_VALUES,
+                    ],
+                    dummy_value=self.distr_output.value_in_support,
+                ),
+            ]
+        )
+    
+    def create_training_network(self) -> DeepARRecPenaltyTrainingNetwork:
+        return DeepARRecPenaltyTrainingNetwork(
+            num_layers=self.num_layers,
+            num_cells=self.num_cells,
+            cell_type=self.cell_type,
+            history_length=self.history_length,
+            context_length=self.context_length,
+            prediction_length=self.prediction_length,
+            distr_output=self.distr_output,
+            dropout_rate=self.dropout_rate,
+            cardinality=self.cardinality,
+            embedding_dimension=self.embedding_dimension,
+            lags_seq=self.lags_seq,
+            scaling=self.scaling,
+            dtype=self.dtype,
+            self_supervised_penalty=self.self_supervised_penalty,
+            hierarchy_agg_dict=self.hierarchy_agg_dict,
+            ignore_future_targets=self.ignore_future_targets,
+            print_rec_penalty=self.print_rec_penalty,
+            embedding_agg_penalty=self.embedding_agg_penalty,
+            embedding_dist_metric=self.embedding_dist_metric,
+        )
+    
+    def create_predictor(
+        self, transformation: Transformation, trained_network: HybridBlock
+    ) -> Predictor:
+        prediction_network = DeepARRecPenaltyPredictionNetwork(
+            num_parallel_samples=self.num_parallel_samples,
+            num_layers=self.num_layers,
+            num_cells=self.num_cells,
+            cell_type=self.cell_type,
+            history_length=self.history_length,
+            context_length=self.context_length,
+            prediction_length=self.prediction_length,
+            distr_output=self.distr_output,
+            dropout_rate=self.dropout_rate,
+            cardinality=self.cardinality,
+            embedding_dimension=self.embedding_dimension,
+            lags_seq=self.lags_seq,
+            scaling=self.scaling,
+            dtype=self.dtype,
+            store_in_sample_residuals=self.store_in_sample_residuals,
+        )
+
+        copy_parameters(trained_network, prediction_network)
+
+        return RepresentableBlockPredictorResiduals(
+            input_transform=transformation,
+            prediction_net=prediction_network,
+            batch_size=self.trainer.batch_size,
+            freq=self.freq,
+            prediction_length=self.prediction_length,
+            ctx=self.trainer.ctx,
+            dtype=self.dtype,
+        )
+
 
 def fit_deepar(
     training_data: ListDataset,
@@ -37,7 +263,6 @@ def fit_deepar(
     hierarchy_agg_dict: Optional[Dict[int, List[int]]] = None,
     ignore_future_targets: bool = False,
     print_rec_penalty: bool = True,
-    tb_log_dir: str = None,
 ) -> Tuple[GluonPredictor, HybridBlock]:
     """ fits DeepAREstimator with optional reconciliation penalties to training dataset
 
@@ -73,7 +298,6 @@ def fit_deepar(
             and past targets in self-supervised reconciliation penalty (default: {False})
         print_rec_penalty {bool} -- whether to print the reconciliation penalty at each step
             of every epoch (default: {True})
-        tb_log_dir {bool} -- filepath to which to write tensorboard loss data (default: {False})
 
     Returns:
         Tuple[GluonPredictor, HybridBlock] -- [description]
@@ -91,10 +315,6 @@ def fit_deepar(
     if use_cat_var is False:
         cardinality = None
 
-    # set random seeds for reproducibility
-    mx.random.seed(0)
-    np.random.seed(0)
-
     estimator = DeepARRecPenaltyEstimator(
         freq=freq, 
         prediction_length=pred_length,
@@ -106,7 +326,6 @@ def fit_deepar(
             epochs=epochs,
             batch_size=batch_size,
             hybridize=False,
-            tb_log_dir=tb_log_dir
         ),
         num_layers=num_layers,
         num_cells=hidden_dim,

@@ -11,5 +11,4 @@ COPY requirements.txt $HOME/
 RUN pip install -r $HOME/requirements.txt
 
 COPY . $HOME/
-RUN pip install -e $HOME/gluon-ts
-RUN pip install -e ".[dev]"
+RUN pip install -e .
