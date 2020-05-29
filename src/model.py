@@ -9,6 +9,7 @@ import pandas as pd
 # Third-party imports
 import mxnet as mx
 from mxnet.gluon import HybridBlock
+from gluonts.transform.sampler import InstanceSampler, BucketInstanceSampler
 from gluonts.trainer import Trainer
 from gluonts.distribution import NegativeBinomialOutput, GaussianOutput
 from gluonts.dataset.util import to_pandas
@@ -41,22 +42,23 @@ from .network import (
 )
 
 class DeepARRecPenaltyEstimator(DeepAREstimator):
-    """ Construct a DeepAREstimator that adds a self-supervised and/or embedding 
+    """ Construct a DeepAREstimator that optionally adds a self-supervised and/or embedding 
         reconciliation penalty to its likelihood loss.
 
-        We overwrite the create_transformation() method to use a FixedUnitSampler() in the 
-        InstanceSplitter() step, which samples exactly one window from each training series. 
-        In each batch, it is necessary to have one sample of each individual series from the 
-        training set to calculate the self-supervised reconciliation penalty, which is applied
-        over all samples from the training set. This is necessary because the DeepAREstimator learns
-        a univariate global model for the dynamics and thus the randomized block coordinate descent
-        optimization algorithm proposed in "A Self-supervised Approach to Hierarchical Forecasting 
-        with Applications to Groupwise Synthetic Controls" is not applicable. 
+        We overwrite the create_transformation() method to use a different InstanceSampler object in the
+        InstanceSplitter step. Specifically, if the self-supervised loss is included, we use a FixedUnitSampler, 
+        which samples exactly one window from each training series. This is because, in each batch, it is 
+        necessary to have one sample of each individual series from the  training set to calculate the 
+        self-supervised reconciliation penalty, which is applied over all samples from the training set.
+        If the self-supervised loss is not included, we use a BucketInstanceSampler, in whcih the 
+        probability of sampling from bucket i is the inverse of its number of elements
+
     """
     
     def __init__(
         self, 
         *args,
+        sampler: InstanceSampler = FixedUnitSampler(),
         self_supervised_penalty: float = 0,
         embedding_agg_penalty: float = 0,
         embedding_dist_metric: str = 'cosine',
@@ -69,6 +71,8 @@ class DeepARRecPenaltyEstimator(DeepAREstimator):
         """
         
         Keyword Arguments:
+            sampler {InstanceSampler} -- GluonTS sampler object containing logic for how to sample mini-batches
+                (default: {FixedUnitSampler()})
             self_supervised_penalty {float} -- lambda for self-supervised reconciliation penalty 
                 (default: {0.0})
             embedding_agg_penalty {float} -- lambda for embedding rec. penalty 
@@ -88,12 +92,16 @@ class DeepARRecPenaltyEstimator(DeepAREstimator):
         """
         super().__init__(*args, **kwargs)
 
-        if self_supervised_penalty > 0:
-            if hierarchy_agg_dict is None:
-                raise ValueError("Must supply 'hierarchy_agg_dict' argument if 'self_supervised_penalty' > 0")
+        if self_supervised_penalty > 0 and hierarchy_agg_dict is None:
+            raise ValueError("Must supply 'hierarchy_agg_dict' argument if 'self_supervised_penalty' > 0")
+
+        if embedding_agg_penalty > 0 and hierarchy_agg_dict is None:
+            raise ValueError("Must supply 'hierarchy_agg_dict' argument if 'embedding_agg_penalty' > 0")
+
         if embedding_dist_metric != 'cosine' and embedding_dist_metric != 'l2':
             raise ValueError("Embedding distance metric must be either 'cosine' or 'l2'")
 
+        self.sampler = sampler
         self.self_supervised_penalty = self_supervised_penalty
         self.hierarchy_agg_dict = hierarchy_agg_dict
         self.ignore_future_targets = ignore_future_targets
@@ -176,7 +184,7 @@ class DeepARRecPenaltyEstimator(DeepAREstimator):
                     is_pad_field=FieldName.IS_PAD,
                     start_field=FieldName.START,
                     forecast_start_field=FieldName.FORECAST_START,
-                    train_sampler=FixedUnitSampler(),
+                    train_sampler=self.sampler,
                     past_length=self.history_length,
                     future_length=self.prediction_length,
                     time_series_fields=[
@@ -256,6 +264,7 @@ def fit_deepar(
     cardinality: Optional[List[int]] = None,
     epochs: int = 25,
     batch_size: int = 32,
+    sampler: Optional[InstanceSampler] = None,
     self_supervised_penalty: float = 0.0,
     embedding_agg_penalty: float = 0,
     embedding_dist_metric: str = 'cosine',
@@ -283,6 +292,8 @@ def fit_deepar(
         epochs {int} -- number of training epochs (default: {25})
         batch_size {int} -- if self-supervised reconciliation penalty > 0, will be set to training set size
             (default: {32})
+        sampler {Optional[InstanceSampler]} -- GluonTS sampler object containing logic for how to sample mini-batches
+            (default: {None})
         self_supervised_penalty {float} -- lambda for self-supervised reconciliation penalty 
             (default: {0.0})
         embedding_agg_penalty {float} -- lambda for embedding rec. penalty 
@@ -306,11 +317,17 @@ def fit_deepar(
     if self_supervised_penalty > 0 and hierarchy_agg_dict is None:
         raise ValueError("Must supply 'hierarchy_agg_dict' argument if 'self_supervised_penalty' > 0")
 
+    if embedding_agg_penalty > 0 and hierarchy_agg_dict is None:
+        raise ValueError("Must supply 'hierarchy_agg_dict' argument if 'embedding_agg_penalty' > 0")
+
     if embedding_dist_metric != 'cosine' and embedding_dist_metric != 'l2':
         raise ValueError("Embedding distance metric must be either 'cosine' or 'l2'")
 
     if self_supervised_penalty > 0:
         batch_size = len(training_data)
+        sampler = FixedUnitSampler()
+    else:
+        sampler = sampler
 
     if use_cat_var is False:
         cardinality = None
@@ -329,6 +346,7 @@ def fit_deepar(
         ),
         num_layers=num_layers,
         num_cells=hidden_dim,
+        sampler=sampler,
         self_supervised_penalty=self_supervised_penalty,
         embedding_agg_penalty=embedding_agg_penalty,
         embedding_dist_metric=embedding_dist_metric,

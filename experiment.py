@@ -29,9 +29,8 @@ from gluonts.core.component import get_mxnet_context
 
 # First-party imports
 from src.data import (
-    preprocess, 
-    make_hierarchy_level_dict, 
-    make_hierarchy_agg_dict, 
+    preprocess_tourism_data, 
+    get_bucket_samplers, 
     split, 
     build_datasets 
 )
@@ -71,7 +70,7 @@ class Experiment(object):
         """ convenience class to reproduce experiments
         
         Keyword Arguments:
-            datapath {str} -- path to Australian tourism data (default: {'data/raw/TourismData_v3.csv'})
+            datapath {str} -- Australia tourism datapath: (default: {'data/raw/TourismData_v3.csv'})
             output_path {str} -- path to write predictions for post-hoc reconciliation 
                 (default: {'data/preds'})
             serialize_path {str} -- path to write serialized models for comparison after post-hoc reconciliation 
@@ -147,30 +146,27 @@ class Experiment(object):
 
     def preprocess(self) -> None:
         
-        ## prepare data
-        tourism_data = pd.read_csv(self.datapath)
-        tourism_data, level_counts, prefix_idxs = preprocess(tourism_data)
+        ## prepare data, create mappings of hierarchy that will be used for fitting/evaluation
+        data, self.hierarchy_agg_dict, self.hierarchy_level_dict = preprocess_tourism_data(self.datapath)
 
         # create train/val/test datasets, one for each of 10 CV folds
         splits = split(
-            tourism_data.values, 
+            data.values, 
             horizon = self.horizon, 
             min_train_size = self.train_size, 
             max_train_size = self.train_size
         )
 
-        self.test_datasets = build_datasets(tourism_data, splits, val = False)
+        self.test_datasets = build_datasets(data, splits, val = False)
         if self.val_set:
-            self.train_datasets = build_datasets(tourism_data, splits)
+            self.train_datasets = build_datasets(data, splits)
         else:
             self.train_datasets = [
                 (train, None, None)
                 for (train, test) in self.test_datasets
             ]
+        self.samplers = get_bucket_samplers([data_splits[0] for data_splits in self.train_datasets])
 
-        # create mappings of hierarchy that will be used for fitting/evaluation
-        self.hierarchy_agg_dict = make_hierarchy_agg_dict(prefix_idxs)
-        self.hierarchy_level_dict = make_hierarchy_level_dict(level_counts)
 
     def fit(self):
 
@@ -184,11 +180,15 @@ class Experiment(object):
                     epochs=self.epochs,
                     use_cat_var=True,
                     cardinality=[len(training_data)],
+                    sampler=sampler,
                     hierarchy_agg_dict=self.hierarchy_agg_dict,
                     embedding_dim_ratio=self.embed_dim_ratio,
                     print_rec_penalty=False,
                 )
-                for (training_data, validation_data, _) in self.train_datasets
+                for (training_data, validation_data, _), sampler in zip(
+                    self.train_datasets, 
+                    self.samplers
+                )
             ],
             # DeepAR models with cosine embedding aggregation penalty
             [
@@ -199,13 +199,16 @@ class Experiment(object):
                     epochs=self.epochs,
                     use_cat_var=True,
                     cardinality=[len(training_data)],
+                    sampler=sampler,
                     hierarchy_agg_dict=self.hierarchy_agg_dict,
                     embedding_dim_ratio=self.embed_dim_ratio,
                     embedding_agg_penalty=self.embed_penalty_lambda,
                     print_rec_penalty=False,
                 )
-                for (training_data, validation_data, _) in self.train_datasets
-            ],
+                for (training_data, validation_data, _), sampler in zip(
+                    self.train_datasets, 
+                    self.samplers
+                )            ],
             # DeepAR models with l2 embedding aggregation penalty
             [
                 fit_deepar(
@@ -215,14 +218,17 @@ class Experiment(object):
                     epochs=self.epochs,
                     use_cat_var=True,
                     cardinality=[len(training_data)],
+                    sampler=sampler,
                     hierarchy_agg_dict=self.hierarchy_agg_dict,
                     embedding_dim_ratio=self.embed_dim_ratio,
                     embedding_agg_penalty=self.embed_penalty_lambda,
                     embedding_dist_metric='l2',
                     print_rec_penalty=False,
                 )
-                for (training_data, validation_data, _) in self.train_datasets
-            ]
+                for (training_data, validation_data, _), sampler in zip(
+                    self.train_datasets, 
+                    self.samplers
+                )            ]
         ]
         if self.include_self_supervised:
             self.fits.append(

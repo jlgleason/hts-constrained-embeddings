@@ -8,7 +8,8 @@ import numpy as np
 from sklearn.model_selection import TimeSeriesSplit
 from gluonts.dataset.field_names import FieldName
 from gluonts.dataset.common import ListDataset
-from gluonts.transform import InstanceSampler
+from gluonts.dataset.stat import calculate_dataset_statistics
+from gluonts.transform import InstanceSampler, BucketInstanceSampler
 from gluonts.core.component import validated
 
 TRAVEL_TYPES = 4
@@ -144,7 +145,7 @@ def all_dfs(
     Returns:
         Tuple[pd.DataFrame, List[int] -- 
             1) single combined dataframe
-            2) oredered list of indices of base forecast df columns that match 
+            2) ordered list of indices of base forecast df columns that match 
                 aggregated forecast column
     """
 
@@ -222,42 +223,13 @@ def level_counts(
     ]
     return [country_cts, state_cts, zone_cts, region_cts]
 
-def preprocess(
-    tourism_df: pd.DataFrame
-) -> Tuple[pd.DataFrame, List[int], List[List[int]]]:
-    """ preprocess hierarchical tourism df into one df with all level series
-    
-    Arguments:
-        tourism_df {pd.DataFrame} -- tourism frame with bottom level series (region/type)
-    
-    Returns:
-        Tuple[pd.DataFrame, List[int], List[List[int]]] -- 
-            1) new df with region, zone, state, and country series as separate columns
-            2) list of the counts of leaves that sum to each node in the hierarchy
-            3) list of list of indices representing the base level series that add up 
-                to each aggregation constraint
-    """
-
-    tourism_df['Year'] = tourism_df['Year'].ffill().astype(int)
-    tourism_df['Date'] = tourism_df['Month'] + ' ' + tourism_df['Year'].astype(str)
-    tourism_df = tourism_df.drop(columns = ['Year', 'Month'])
-    tourism_df = tourism_df.set_index('Date')
-
-    travel_types = [col[-3:] for col in tourism_df.columns[:4]]
-    prefixes = unique_prefixes(tourism_df.columns, [1,2,3])
-    labels = regex_labels(travel_types, prefixes)
-    all_df, prefix_idxs = all_dfs(tourism_df, labels)
-    counts = level_counts(prefixes, labels)
-
-    return all_df, counts, prefix_idxs
-
 def make_hierarchy_level_dict(
-    level_counts: List[List[int]]
+    level_cts: List[List[int]]
 ) -> Dict[str, List[int]]:
     """ creates dict of which columns (series) belong to which level of hierarchy 
     
     Arguments:
-        level_counts {List[List[int]]} -- list of the counts of leaves that sum to each node, 
+        level_cts {List[List[int]]} -- list of the counts of leaves that sum to each node, 
             one list for each level in the hierarchy
     
     Returns:
@@ -267,7 +239,7 @@ def make_hierarchy_level_dict(
     def idx_func(idx_list):
         return [i for i in range(len(idx_list))]
 
-    level_agg = level_counts[0] + level_counts[1] + [sum(level_counts[2])] + [sum(level_counts[3])]
+    level_agg = level_cts[0] + level_cts[1] + [sum(level_cts[2])] + [sum(level_cts[3])]
     level_agg += [l * TRAVEL_TYPES for l in level_agg]
 
     return {
@@ -293,6 +265,40 @@ def make_hierarchy_agg_dict(
     """
 
     return {agg_idx: base_idxs for agg_idx, base_idxs in enumerate(prefix_idxs)}
+
+def preprocess_tourism_data(
+    datapath: str
+) -> Tuple[pd.DataFrame, Dict[int, Tuple[int, List[int]]], Dict[str, List[int]]]:
+    """ preprocess hierarchical tourism df into one df with all level series, create dictionaries
+        of aggregation constraints and hierarchy level membership
+    
+    Arguments:
+        datapath {str} -- filepath to raw tourism data csv
+    
+    Returns:
+        Tuple[pd.DataFrame, Dict[int, Tuple[int, List[int]]], Dict[str, List[int]]] -- 
+            1) df with region, zone, state, and country series as separate columns
+            2) dictionary with this structure:
+                constraint number: (aggregate series index, [disaggregated series indices])
+            3) mapping from hierachy level to columns in that level of hierarchy
+    """
+
+    tourism_df = pd.read_csv(datapath)
+    tourism_df['Year'] = tourism_df['Year'].ffill().astype(int)
+    tourism_df['Date'] = tourism_df['Month'] + ' ' + tourism_df['Year'].astype(str)
+    tourism_df = tourism_df.drop(columns = ['Year', 'Month'])
+    tourism_df = tourism_df.set_index('Date')
+
+    travel_types = [col[-3:] for col in tourism_df.columns[:4]]
+    prefixes = unique_prefixes(tourism_df.columns, [1,2,3])
+    labels = regex_labels(travel_types, prefixes)
+    all_df, prefix_idxs = all_dfs(tourism_df, labels)
+    counts = level_counts(prefixes, labels)
+
+    hierarchy_agg_dict = make_hierarchy_agg_dict(prefix_idxs)
+    hierarchy_level_dict = make_hierarchy_level_dict(counts)
+
+    return all_df, hierarchy_agg_dict, hierarchy_level_dict
 
 def inspect_hierarchy_agg_dict(
     hierarchy_agg_dict: Dict[int, Tuple[int, List[int]]],
@@ -336,7 +342,6 @@ def split(
 
     n_splits = X.shape[0] // horizon - 1
     splits = TimeSeriesSplit(n_splits=n_splits, max_train_size=max_train_size)
-
     if min_train_size is None:
         min_train_size = horizon
 
@@ -351,6 +356,7 @@ def split(
 def build_datasets(
     data_df: pd.DataFrame, 
     splits: List[Tuple[List[int]]],
+    freq: str = 'M',
     val: bool = True,
 ) ->  List[Tuple[ListDataset]]:
     """ creates a list of gluonts train/val(optional)/test tuples, one for each CV fold
@@ -360,11 +366,13 @@ def build_datasets(
         splits {List[Tuple[List[int]]]} -- list of train/test index tuples
         
     Keyword Arguments:
+        freq {str} -- frequency of time series (default: {'M'})
         val {bool} -- whether to segment part of the training set for validation. If True, 
             last `horizon` length idxs will be used as validation set (default: {True})
     
     Returns:
-        List[Tuple[ListDataset]] -- list of gluonts train/test tuples, one for each CV fold
+        List[Tuple[ListDataset]] -- list of GluonTS train/test or train/val/test tuples,
+            one for each CV fold
     """
 
     if val:
@@ -372,35 +380,35 @@ def build_datasets(
             (ListDataset(
                 [
                     {
-                        FieldName.START: data_df.iloc[train_idxs[:-len(test_idxs)],:].index[0],
+                        FieldName.START: data_df.iloc[train_idxs[:-len(test_idxs)],col_idx].index[0],
                         FieldName.TARGET: data_df.iloc[train_idxs[:-len(test_idxs)],col_idx].values,
                         FieldName.FEAT_STATIC_CAT: np.array([col_idx]),
                     }
                     for col_idx in range(data_df.shape[1])
                 ],
-                freq='M'
+                freq=freq
             ),
             ListDataset(
                 [
                     {
-                        FieldName.START: data_df.iloc[train_idxs[-len(test_idxs):],:].index[0],
+                        FieldName.START: data_df.iloc[train_idxs[-len(test_idxs):],col_idx].index[0],
                         FieldName.TARGET: data_df.iloc[train_idxs[-len(test_idxs):],col_idx].values,
                         FieldName.FEAT_STATIC_CAT: np.array([col_idx]),
                     }
                     for col_idx in range(data_df.shape[1])
                 ],
-                freq='M'
+                freq=freq
             ),
             ListDataset(
                 [
                     {
-                        FieldName.START: data_df.iloc[test_idxs,:].index[0],
+                        FieldName.START: data_df.iloc[test_idxs,col_idx].index[0],
                         FieldName.TARGET: data_df.iloc[test_idxs,col_idx].values,
                         FieldName.FEAT_STATIC_CAT: np.array([col_idx]),
                     }
                     for col_idx in range(data_df.shape[1])
                 ],
-                freq='M'
+                freq=freq
             ))
             for (train_idxs, test_idxs) in splits 
         ]
@@ -409,27 +417,43 @@ def build_datasets(
             (ListDataset(
                 [
                     {
-                        FieldName.START: data_df.iloc[train_idxs,:].index[0],
+                        FieldName.START: data_df.iloc[train_idxs,col_idx].index[0],
                         FieldName.TARGET: data_df.iloc[train_idxs,col_idx].values,
                         FieldName.FEAT_STATIC_CAT: np.array([col_idx]),
                     }
                     for col_idx in range(data_df.shape[1])
                 ],
-                freq='M'
+                freq=freq
             ),
             ListDataset(
                 [
                     {
-                        FieldName.START: data_df.iloc[test_idxs,:].index[0],
+                        FieldName.START: data_df.iloc[test_idxs,col_idx].index[0],
                         FieldName.TARGET: data_df.iloc[test_idxs,col_idx].values,
                         FieldName.FEAT_STATIC_CAT: np.array([col_idx]),
                     }
                     for col_idx in range(data_df.shape[1])
                 ],
-                freq='M'
+                freq=freq
             ))
             for (train_idxs, test_idxs) in splits 
         ]
+
+def get_bucket_samplers(
+    ts_datasets: List[ListDataset]
+) -> List[BucketInstanceSampler]:
+    """ generate BucketInstanceSampler for each dataset in ts_datasets based on 
+        distribution of that dataset
+
+    Arguments:
+        ts_datasets {List[ListDataset]} -- GluonTS dataset object
+
+    Returns:
+        List[BucketInstanceSampler] -- list of samplers in which, for each,
+            the probability of sampling from bucket i is the inverse of its number of elements
+    """
+    dataset_stats = [calculate_dataset_statistics(ts_dataset) for ts_dataset in ts_datasets]
+    return [BucketInstanceSampler(stats.scale_histogram) for stats in dataset_stats]
 
 class FixedUnitSampler(InstanceSampler):
     """

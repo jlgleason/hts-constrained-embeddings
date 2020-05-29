@@ -37,5 +37,5 @@ Run the `experiment.py` script with the following flags to reproduce:
 5. **Relative Embedding Dimension: 2**:
 `python experiment.py reproduce --embed_dim_ratio=2 --metrics_file='data/metrics/edim2.txt' --output_path='data/preds_edim2' --serialize_path='data/models_edim2' --reconciled_path='data/reconciled_preds_edim2'`
 
-7. **Relative Embedding Dimension: 4**:
+6. **Relative Embedding Dimension: 4**:
 `python experiment.py reproduce --embed_dim_ratio=4 --metrics_file='data/metrics/edim4.txt' --output_path='data/preds_edim4' --serialize_path='data/models_edim4' --reconciled_path='data/reconciled_preds_edim4'`
