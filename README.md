@@ -34,8 +34,12 @@ Run the `experiment.py` script with the following flags to reproduce:
 4. **Relative Embedding Dimension: 0.5**:
 `python experiment.py reproduce --embed_dim_ratio=0.5 --metrics_file='data/metrics/edim05.txt' --output_path='data/preds_edim05' --serialize_path='data/models_edim05' --reconciled_path='data/reconciled_preds_edim05'`
 
-5. **Relative Embedding Dimension: 2**:
-`python experiment.py reproduce --embed_dim_ratio=2 --metrics_file='data/metrics/edim2.txt' --output_path='data/preds_edim2' --serialize_path='data/models_edim2' --reconciled_path='data/reconciled_preds_edim2'`
+5. **Relative Embedding Dimension: 1**:
+`python experiment.py reproduce --embed_dim_ratio=1 --metrics_file='data/metrics/edim2.txt' --output_path='data/preds_edim2' --serialize_path='data/models_edim2' --reconciled_path='data/reconciled_preds_edim2'`
 
 6. **Relative Embedding Dimension: 4**:
 `python experiment.py reproduce --embed_dim_ratio=4 --metrics_file='data/metrics/edim4.txt' --output_path='data/preds_edim4' --serialize_path='data/models_edim4' --reconciled_path='data/reconciled_preds_edim4'`
+
+5. **Relative Embedding Dimension: 8**:
+`python experiment.py reproduce --embed_dim_ratio=8 --metrics_file='data/metrics/edim2.txt' --output_path='data/preds_edim2' --serialize_path='data/models_edim2' --reconciled_path='data/reconciled_preds_edim2'`
+

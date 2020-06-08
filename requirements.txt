@@ -6,4 +6,4 @@ scikit-learn
 pmdarima
 mxnet==1.6
 gluonts #git+https://github.com/awslabs/gluon-ts@master#egg=gluonts
-
+seaborn

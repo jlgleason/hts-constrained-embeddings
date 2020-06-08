@@ -62,7 +62,7 @@ class Experiment(object):
         val_set: bool = False,
         include_self_supervised: bool = False,
         include_arima: bool = False,
-        embed_dim_ratio: int = 1,
+        embed_dim_ratio: int = 2,
         embed_penalty_lambda: int = 1,
         self_sup_penalty_lambda: float = 10e-7,
     ) -> None:
