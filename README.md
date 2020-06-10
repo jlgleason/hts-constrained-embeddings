@@ -8,7 +8,7 @@ The Australian travel flow data used in experiments can be downloaded here: http
 
 # Experiments
 
-Run the `experiment.py` script with the following flags to reproduce:
+Run the `experiment.py` script with the following flags to reproduce experiments:
 
 1. **Initial Experiment**:
     1. `python experiment.py reproduce --metrics_file='data/metrics/baseline.txt' --output_path='data/preds_baseline' --serialize_path='data/models_baseline' --reconciled_path='data/reconciled_preds_baseline'`
@@ -43,3 +43,15 @@ Run the `experiment.py` script with the following flags to reproduce:
 5. **Relative Embedding Dimension: 8**:
 `python experiment.py reproduce --embed_dim_ratio=8 --metrics_file='data/metrics/edim2.txt' --output_path='data/preds_edim2' --serialize_path='data/models_edim2' --reconciled_path='data/reconciled_preds_edim2'`
 
+# Plots
+
+Run the `plot.py` script with the following flags to reproduce plots. Experiments must first be run and log data must be downloaded from tensorboard. 
+
+1. **Initial Experiment**:
+`python plot.py --fig_title='baseline'`
+
+2. **Short Training Sequences**:
+`python plot.py --fig_title='small'`
+
+3. **Long Forecast Horizon**:
+`python plot.py --fig_title='horizon'`
