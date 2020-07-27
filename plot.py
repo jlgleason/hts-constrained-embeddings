@@ -40,16 +40,16 @@ def plot(
         ]
         col = 'experiment'
     elif fig_title == 'baseline':
-        experiment_dirs: List[str] = ['data/logs/sampler_edim2']
+        experiment_dirs: List[str] = ['data/logs/sum_cosine_distance']
         experiment_names = ['Embedding Dim. Ratio 2']
         col = None
     elif fig_title == 'small':
-        experiment_dirs: List[str] = ['data/logs/sampler_small_edim2']
+        experiment_dirs: List[str] = ['data/logs/sum_cosine_distance_small']
         experiment_names = ['Small Training Sequences']
         col = None
     elif fig_title == 'horizon':
-        experiment_dirs: List[str] = ['data/logs/sampler_horizon_edim2']
-        experiment_names = ['Short Forecast Horizon']
+        experiment_dirs: List[str] = ['data/logs/sum_cosine_distance_horizon']
+        experiment_names = ['Long Forecast Horizon']
         col = None
     else:
         raise ValueError("experiment must be one of 'dim_comparison', 'baseline', 'small', or 'horizon'")
@@ -82,6 +82,7 @@ def plot(
         col = col, 
         kind = "line",
     )
+    plt.ylim(5.4, 7)
     plt.savefig(f'plots/{fig_title}')
     plt.show()
 

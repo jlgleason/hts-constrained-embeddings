@@ -37,26 +37,22 @@ class DeepARRecPenaltyTrainingNetwork(DeepARTrainingNetwork):
         
         Embedding reconciliation penalty:
             
-            t_0 < t < T := time steps (if t_0 == 0 we consider all time steps)
-            c := total number of aggregation constraints
-            j_0 := index of aggregate series in constraint j
-            j_1 ... j_m := indices of disaggregated series in constraint j that sum to j_0 series
-            X_cat_j_k := 1-hot categorical value of series at index k in constraint j
-            E(X_cat_j_k) := learned embedding of this previous value
+            C := total number of aggregation constraints
+            c_0 := index of aggregate series in constraint c
+            c_1 ... c_j := indices of disaggregated series in constraint c that sum to c_0 series
+            X_cat_c_j := 1-hot categorical value of series at index j in constraint c
+            E(X_cat_c_j) := learned embedding of this previous value
 
-            lambda * sum_{t_0 < t < T, 0 <= j < c}(
-                l2_norm(
-                    E(X_cat_j_0) - sum_{j_1 <= j_k <= j_m}E(X_cat_j_k)
-                )^2
+            lambda * sum_{0 <= c < C, j <= 1 <= J}(
+                l2_norm(E(X_cat_c_0) - E(X_cat_c_j))^2
             )
 
             or 
 
-            lambda * sum_{t_0 < t < T, 0 <= j < c}(
-                cosine_distance(
-                    E(X_cat_j_0) - sum_{j_1 <= j_k <= j_m}E(X_cat_j_k)
-                )^2
+            lambda * sum_{0 <= c < C, j <= 1 <= J}(
+                cosine_distance(E(X_cat_c_0) - E(X_cat_c_j))^2
             )
+
     """
     
     def __init__(
@@ -197,7 +193,7 @@ class DeepARRecPenaltyTrainingNetwork(DeepARTrainingNetwork):
         
         total_loss = F.sum(weighted_loss) / weighted_loss.shape[0]
         print_string = f'Forecasting loss: {total_loss.asscalar()}'
-        
+
         # add self-supervised reconciliation loss
         if self.self_supervised_penalty > 0:
             agg_preds = F.take(distr.mean, F.array(list(self.hierarchy_agg_dict.keys())))
@@ -209,35 +205,54 @@ class DeepARRecPenaltyTrainingNetwork(DeepARTrainingNetwork):
                 dim=0
             ).reshape(agg_preds.shape)
             f_loss = F.sum(F.square(agg_preds - F.sum(disagg_preds, axis=0)))
-        
+
         # add embedding reconciliation loss
         if self.embedding_agg_penalty > 0:
             embedded = self.embedder(
                 F.expand_dims(F.array([i for i in range(self.cardinality[0])]), axis=1)
             )
-            agg_embeds = F.take(embedded, F.array(list(self.hierarchy_agg_dict.keys())))
-            disagg_embeds = F.concat(
-                *[
-                    F.sum(F.take(embedded, F.array(disagg_idxs)), axis = 0) 
-                    for disagg_idxs in self.hierarchy_agg_dict.values()
-                ],
-                dim=0
-            ).reshape(agg_embeds.shape)
+            
+            agg_embeds = F.take(embedded, F.array(list(self.hierarchy_agg_dict.keys())))            
+            agg_copies = agg_embeds.copy().detach()
+
+            disagg_embeds = [
+                F.take(embedded, F.array(disagg_idxs))
+                for disagg_idxs in self.hierarchy_agg_dict.values()
+            ]
+            disagg_lens = [len(disagg) for disagg in disagg_embeds]
+            max_len = max(disagg_lens) + 1
+            dim = embedded.shape[1]
+            disagg_embeds = [
+                F.concat(
+                    *[
+                        disagg, 
+                        F.tile(agg, max_len - disagg.shape[0]).reshape(-1, dim)
+                    ],
+                    dim=0
+                ).reshape(-1,dim).expand_dims(axis=0)
+                for agg, disagg in zip(agg_copies, disagg_embeds)
+            ]
+            disagg_embeds = F.concat(*disagg_embeds, dim=0)
+
             if self.embedding_dist_metric == 'cosine':
-                x = F.L2Normalization(agg_embeds)
-                y = F.L2Normalization(disagg_embeds)
-                x = F.expand_dims(x, axis=1)
-                y = F.expand_dims(y, axis=2)
-                e_loss = F.batch_dot(x, y).reshape((-1, ))
+                agg_embeds = F.L2Normalization(agg_embeds).expand_dims(axis=2)
+                disagg_embeds = F.L2Normalization(disagg_embeds, mode='spatial')
+                e_loss = 1 - F.batch_dot(disagg_embeds, agg_embeds)
             else:
-                e_loss = F.square(F.norm(agg_embeds - disagg_embeds))
+                agg_embeds = agg_embeds.expand_dims(axis=1)
+                stability_constant = 1e-7
+                e_loss = F.norm(
+                    agg_embeds - disagg_embeds + stability_constant, 
+                    axis=2
+                )
+                e_loss = F.square(e_loss)
 
         if self.self_supervised_penalty > 0:
             total_f_loss = F.sum(f_loss) / weighted_loss.shape[0] / len(self.hierarchy_agg_dict)
             total_loss = total_loss + total_f_loss * F.array([self.self_supervised_penalty])
 
         if self.embedding_agg_penalty > 0:
-            total_e_loss = F.sum(e_loss) / weighted_loss.shape[0] / len(self.hierarchy_agg_dict)
+            total_e_loss = F.sum(e_loss) / len(self.hierarchy_agg_dict)
             total_loss = total_loss + total_e_loss * F.array([self.embedding_agg_penalty])
 
         # print forecasting/reconciliation loss at each step
