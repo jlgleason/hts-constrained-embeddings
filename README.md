@@ -1,6 +1,6 @@
 # hts-constrained-embeddings
 
-This repository contains code to reproduce the experiments in **"Forecasting Hierarchical Time Series with a Regularized Embedding Space"**
+This repository contains code to reproduce the experiments in **"Forecasting Hierarchical Time Series with a Regularized Embedding Space"** from the *6th Workshop on Mining and Learning from Time Series at KDD '20*.
 
 # Data
 
