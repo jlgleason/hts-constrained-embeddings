@@ -4,7 +4,7 @@ This repository contains code to reproduce the experiments in **"Forecasting Hie
 
 # Data
 
-The Australian travel flow data used in experiments can be downloaded here: https://robjhyndman.com/publications/hierarchical-tourism/.
+The Australian travel flow data used in experiments can be downloaded here: https://robjhyndman.com/publications/mint/.
 
 # Experiments
 
