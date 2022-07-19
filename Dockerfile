@@ -1,5 +1,6 @@
 # syntax=docker/dockerfile:1.0.0-experimental
-FROM continuumio/miniconda3
+#FROM continuumio/miniconda3
+FROM python:3.8-slim
 
 ENV LANG=C.UTF-8 LC_ALL=C.UTF-8
 ENV HOME=/root
